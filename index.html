@@ -60,6 +60,55 @@
   #empty b { color: var(--text); display: block; font-size: 18px; margin-bottom: 8px; }
   #empty .pill { margin-top: 20px; font-size: 16px; padding: 12px 22px; color: #fff; }
 
+  [hidden] { display: none !important; }
+
+  #chips {
+    display: flex; gap: 8px; padding: 10px 16px; overflow-x: auto; flex: none;
+    border-bottom: 1px solid var(--line); scrollbar-width: none;
+  }
+  #chips::-webkit-scrollbar { display: none; }
+  .chip {
+    flex: none; padding: 7px 14px; border-radius: 999px; font-size: 14px;
+    background: var(--panel); border: 1px solid var(--line); color: var(--sub); white-space: nowrap;
+  }
+  .chip.active { background: var(--text); border-color: var(--text); color: var(--bg); font-weight: 600; }
+  .chip.playing::before { content: "♪ "; color: var(--accent); }
+  .chip.new { border-style: dashed; }
+
+  #plBar { display: flex; gap: 8px; padding: 10px 16px; flex-wrap: wrap; border-bottom: 1px solid var(--line); }
+  .editOnly { display: none; }
+  body.editing .editOnly { display: inline-block; }
+  .pill.danger { color: var(--danger); }
+  .hint { padding: 48px 28px; text-align: center; color: var(--sub); line-height: 1.7; font-size: 14px; }
+
+  #sheet {
+    position: fixed; inset: 0; background: rgba(0,0,0,.55); z-index: 10;
+    display: flex; align-items: flex-end;
+  }
+  .sheetBox {
+    width: 100%; max-height: 85%; display: flex; flex-direction: column;
+    background: var(--panel); border-radius: 16px 16px 0 0;
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+  .sheetHead {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 14px 16px; border-bottom: 1px solid var(--line);
+  }
+  .sheetHead button { font-size: 16px; color: var(--accent); padding: 4px; }
+  #sheetOk { font-weight: 700; }
+  #sheetBody { overflow-y: auto; -webkit-overflow-scrolling: touch; }
+  .nameInput {
+    display: block; width: calc(100% - 32px); margin: 16px; padding: 12px 14px;
+    font: inherit; font-size: 16px; color: var(--text);
+    background: var(--bg); border: 1px solid var(--line); border-radius: 10px; outline: none;
+    -webkit-user-select: text; user-select: text;
+  }
+  .pickList { list-style: none; margin: 0; padding: 0; }
+  .pickList li { display: flex; align-items: center; gap: 12px; padding: 13px 16px; border-bottom: 1px solid var(--line); }
+  .pickList .mark { width: 22px; height: 22px; border-radius: 50%; border: 2px solid var(--sub); flex: none; }
+  .pickList li.picked .mark { background: var(--accent); border-color: var(--accent); }
+  .pickList .pickText { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
   #status { text-align: center; font-size: 13px; color: var(--sub); padding: 8px; min-height: 0; }
   #status:empty { display: none; }
 
@@ -89,9 +138,21 @@
   <button class="pill primary" id="addBtn">+ 추가</button>
 </header>
 
+<nav id="chips"></nav>
+
 <main>
   <div id="status"></div>
+  <div id="plBar" hidden>
+    <button class="pill" id="plAddBtn">보관함에서 곡 선택</button>
+    <button class="pill editOnly" id="plRenameBtn">이름 변경</button>
+    <button class="pill editOnly danger" id="plDeleteBtn">목록 삭제</button>
+  </div>
   <ul id="list"></ul>
+  <div id="emptyList" class="hint" hidden>
+    이 목록에는 아직 곡이 없습니다.<br>
+    '보관함에서 곡 선택'으로 저장된 곡을 담거나,<br>
+    '+ 추가'로 새 음원을 가져오면 이 목록에 함께 담깁니다.
+  </div>
   <div id="empty" hidden>
     <b>저장된 음원이 없습니다</b>
     '파일' 앱에 다운로드한 음원을 여러 개 선택하여 가져오면,<br>
@@ -124,6 +185,17 @@
     </button>
   </div>
 </footer>
+
+<div id="sheet" hidden>
+  <div class="sheetBox">
+    <div class="sheetHead">
+      <button id="sheetCancel">취소</button>
+      <b id="sheetTitle"></b>
+      <button id="sheetOk">완료</button>
+    </div>
+    <div id="sheetBody"></div>
+  </div>
+</div>
 
 <input type="file" id="picker" multiple hidden
        accept="audio/*,.mp3,.m4a,.aac,.wav,.flac,.aiff,.caf">

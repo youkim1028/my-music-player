@@ -1,17 +1,24 @@
 'use strict';
 
 // ---------- 저장소 (IndexedDB) ----------
-// meta: 곡 정보(이름, 순서), data: 실제 음원 바이트. 목록을 그릴 때 음원 전체를 읽지 않도록 분리한다.
+// meta: 곡 정보(이름, 순서), data: 실제 음원 바이트, playlists: 플레이리스트.
+// 목록을 그릴 때 음원 전체를 읽지 않도록 meta와 data를 분리한다.
 const DB_NAME = 'my-music';
 let dbPromise;
 
 function openDb() {
   if (!dbPromise) {
     dbPromise = new Promise((resolve, reject) => {
-      const r = indexedDB.open(DB_NAME, 1);
-      r.onupgradeneeded = () => {
-        r.result.createObjectStore('meta', { keyPath: 'id', autoIncrement: true });
-        r.result.createObjectStore('data');
+      const r = indexedDB.open(DB_NAME, 2);
+      r.onupgradeneeded = (e) => {
+        const d = r.result;
+        if (e.oldVersion < 1) {
+          d.createObjectStore('meta', { keyPath: 'id', autoIncrement: true });
+          d.createObjectStore('data');
+        }
+        if (e.oldVersion < 2) {
+          d.createObjectStore('playlists', { keyPath: 'id', autoIncrement: true });
+        }
       };
       r.onsuccess = () => resolve(r.result);
       r.onerror = () => reject(r.error);
@@ -20,7 +27,7 @@ function openDb() {
   return dbPromise;
 }
 
-// 트랜잭션 하나를 열고, work(t)가 돌려준 값을 트랜잭션 완료 후에 반환한다.
+// 트랜잭션 하나를 열고, work가 box.value에 담은 값을 트랜잭션 완료 후에 반환한다.
 async function withTx(stores, mode, work) {
   const d = await openDb();
   return new Promise((resolve, reject) => {
@@ -32,8 +39,8 @@ async function withTx(stores, mode, work) {
   });
 }
 
-const dbAllMeta = () => withTx(['meta'], 'readonly', (t, box) => {
-  const r = t.objectStore('meta').getAll();
+const dbAll = (store) => withTx([store], 'readonly', (t, box) => {
+  const r = t.objectStore(store).getAll();
   r.onsuccess = () => { box.value = r.result; };
 });
 
@@ -59,11 +66,24 @@ const dbDelete = (id) => withTx(['meta', 'data'], 'readwrite', (t) => {
   t.objectStore('data').delete(id);
 });
 
+// 새 플레이리스트는 id 없이 저장하며, 저장소가 부여한 id를 반환한다.
+const dbPutPlaylist = (p) => withTx(['playlists'], 'readwrite', (t, box) => {
+  const r = t.objectStore('playlists').put(p);
+  r.onsuccess = () => { box.value = r.result; };
+});
+
+const dbDeletePlaylist = (id) => withTx(['playlists'], 'readwrite', (t) => {
+  t.objectStore('playlists').delete(id);
+});
+
 // ---------- 상태 ----------
 const $ = (id) => document.getElementById(id);
 const audio = $('audio');
 
-let tracks = [];            // 저장 순서대로 정렬된 곡 정보
+let tracks = [];            // 보관함의 모든 곡 (저장 순서)
+let playlists = [];         // { id, name, trackIds }
+let viewId = null;          // 화면에 표시 중인 목록 (null이면 전체 곡)
+let contextId = null;       // 재생 중인 목록 (null이면 전체 곡)
 let queue = [];             // 실제 재생 순서(셔플 반영)를 담은 id 배열
 let currentId = null;
 let shuffle = localStorage.getItem('shuffle') === '1';
@@ -79,6 +99,16 @@ const MIME = { mp3: 'audio/mpeg', m4a: 'audio/mp4', aac: 'audio/aac', wav: 'audi
 const PLAY_PATH = 'M8 5v14l11-7z';
 const PAUSE_PATH = 'M6 5h4v14H6zm8 0h4v14h-4z';
 
+const trackById = (id) => tracks.find((t) => t.id === id);
+const playlistById = (id) => playlists.find((p) => p.id === id);
+const isEditing = () => document.body.classList.contains('editing');
+
+// 목록에 속한 곡 id를 순서대로 반환한다. listId가 null이면 보관함 전체이다.
+function idsOf(listId) {
+  const p = listId == null ? null : playlistById(listId);
+  return p ? p.trackIds.filter(trackById) : tracks.map((t) => t.id);
+}
+
 function splitName(name) {
   const base = name.replace(/\.[^.]+$/, '');
   const i = base.indexOf(' - ');
@@ -91,9 +121,14 @@ function fmt(sec) {
   return (h ? h + ':' + String(m).padStart(2, '0') : m) + ':' + String(s).padStart(2, '0');
 }
 
+function setContext(id) {
+  contextId = id;
+  if (id == null) localStorage.removeItem('context'); else localStorage.setItem('context', String(id));
+}
+
 // ---------- 재생 순서 ----------
 function rebuildQueue() {
-  const ids = tracks.map((t) => t.id);
+  const ids = idsOf(contextId);
   if (!shuffle) { queue = ids; return; }
   const rest = ids.filter((id) => id !== currentId);
   for (let i = rest.length - 1; i > 0; i--) {
@@ -151,7 +186,7 @@ function setSource(track, url, autoplay, at) {
 }
 
 async function playTrack(id, autoplay = true, at = 0) {
-  const track = tracks.find((t) => t.id === id);
+  const track = trackById(id);
   if (!track) return;
   const url = await getUrl(id);
   if (!url) { setStatus('음원 데이터를 찾지 못했습니다.'); return; }
@@ -174,9 +209,28 @@ function userPlay(id) {
   playTrack(id, true, 0);
 }
 
+// 화면에 표시된 목록에서 곡을 선택하면, 그 목록이 재생 대상이 된다.
+function playFromView(id) {
+  if (contextId !== viewId) {
+    setContext(viewId);
+    currentId = id;
+    rebuildQueue();
+    renderChips();
+  }
+  userPlay(id);
+}
+
 function togglePlay() {
-  if (!tracks.length) return;
-  if (currentId == null || !realSource) { userPlay(queue[0]); return; }
+  if (currentId == null || !realSource) {
+    const ids = idsOf(viewId);
+    if (ids.length) {
+      setContext(viewId);
+      rebuildQueue();
+      renderChips();
+      userPlay(queue[0]);
+    }
+    return;
+  }
   if (audio.paused) audio.play().catch(() => {}); else audio.pause();
 }
 
@@ -197,8 +251,7 @@ audio.addEventListener('ended', () => {
   if (repeat === 'one') { audio.currentTime = 0; audio.play().catch(() => {}); return; }
   const id = neighborId(1, repeat === 'all');
   if (id == null) { updatePlayIcon(); return; }
-  const track = tracks.find((t) => t.id === id);
-  if (urls.has(id)) setSource(track, urls.get(id), true, 0);
+  if (urls.has(id)) setSource(trackById(id), urls.get(id), true, 0);
   else playTrack(id, true, 0);
 });
 
@@ -227,6 +280,7 @@ function savePosition() {
 }
 
 audio.addEventListener('play', updatePlayIcon);
+audio.addEventListener('playing', () => { if (realSource) bindMediaActions(); });
 audio.addEventListener('pause', () => { updatePlayIcon(); savePosition(); });
 audio.addEventListener('error', () => {
   if (realSource && audio.error) setStatus('이 파일은 재생할 수 없는 형식입니다.');
@@ -235,8 +289,9 @@ document.addEventListener('visibilitychange', savePosition);
 
 // ---------- 잠금 화면 / 제어 센터 ----------
 function updateNowPlaying() {
-  const track = tracks.find((t) => t.id === currentId);
+  const track = trackById(currentId);
   const info = track ? splitName(track.name) : null;
+  const list = playlistById(contextId);
   $('nowTitle').textContent = info ? info.title : '재생할 곡을 선택하세요';
   $('nowArtist').textContent = info ? info.artist : '';
   if (!info) { $('curTime').textContent = $('durTime').textContent = '0:00'; $('seek').value = 0; }
@@ -244,7 +299,7 @@ function updateNowPlaying() {
     navigator.mediaSession.metadata = new MediaMetadata({
       title: info.title,
       artist: info.artist,
-      album: '내 음원',
+      album: list ? list.name : '내 음원',
       artwork: [{ src: 'icon-512.png', sizes: '512x512', type: 'image/png' }],
     });
   }
@@ -262,12 +317,18 @@ function updatePositionState() {
   } catch (e) { /* 일부 기기에서는 지원하지 않는다 */ }
 }
 
-if ('mediaSession' in navigator) {
+// iOS는 '10초 이동' 동작이 등록되어 있거나 이전/다음 곡 동작이 인식되지 않으면
+// 잠금 화면에 10초 이동 버튼을 표시한다. 그래서 10초 이동 동작을 명시적으로 해제하고,
+// 재생이 실제로 시작될 때마다 이전/다음 곡 동작을 다시 등록한다.
+function bindMediaActions() {
+  if (!('mediaSession' in navigator)) return;
   const set = (name, fn) => { try { navigator.mediaSession.setActionHandler(name, fn); } catch (e) {} };
+  set('seekbackward', null);
+  set('seekforward', null);
   set('play', () => audio.play().catch(() => {}));
   set('pause', () => audio.pause());
-  set('nexttrack', goNext);
   set('previoustrack', goPrev);
+  set('nexttrack', goNext);
   set('seekto', (e) => { if (e.seekTime != null) audio.currentTime = e.seekTime; });
 }
 
@@ -289,14 +350,38 @@ function updateModeButtons() {
 }
 
 function updateInfo() {
-  const bytes = tracks.reduce((sum, t) => sum + (t.size || 0), 0);
-  $('info').textContent = tracks.length ? `${tracks.length}곡 · ${(bytes / 1048576).toFixed(1)}MB` : '';
+  const shown = idsOf(viewId).map(trackById);
+  const bytes = shown.reduce((sum, t) => sum + (t.size || 0), 0);
+  $('info').textContent = shown.length ? `${shown.length}곡 · ${(bytes / 1048576).toFixed(1)}MB` : '';
+}
+
+function renderChips() {
+  const box = $('chips');
+  box.textContent = '';
+  const chip = (text, id, extra) => {
+    const b = document.createElement('button');
+    b.className = 'chip' + (extra || '');
+    b.textContent = text;
+    if (id !== undefined) {
+      if (id === viewId) b.classList.add('active');
+      if (id === contextId && currentId != null) b.classList.add('playing');
+      b.addEventListener('click', () => { viewId = id; renderChips(); renderList(); });
+    }
+    box.append(b);
+    return b;
+  };
+  chip('전체 곡', null);
+  playlists.forEach((p) => chip(p.name, p.id));
+  chip('+ 새 목록', undefined, ' new').addEventListener('click', createPlaylist);
 }
 
 function renderList() {
   const list = $('list');
+  const inPlaylist = viewId != null;
   list.textContent = '';
-  tracks.forEach((track, i) => {
+  const shown = idsOf(viewId).map(trackById);
+
+  shown.forEach((track, i) => {
     const info = splitName(track.name);
     const li = document.createElement('li');
     if (track.id === currentId) li.className = 'current';
@@ -328,45 +413,183 @@ function renderList() {
     tools.append(
       mk('위로 이동', '▲', '', () => moveTrack(i, -1)),
       mk('아래로 이동', '▼', '', () => moveTrack(i, 1)),
-      mk('삭제', '✕', 'del', () => removeTrack(track)),
+      mk(inPlaylist ? '목록에서 빼기' : '삭제', '✕', 'del', () => removeTrack(track)),
     );
 
     li.append(num, meta, tools);
-    li.addEventListener('click', () => {
-      if (!document.body.classList.contains('editing')) userPlay(track.id);
-    });
+    li.addEventListener('click', () => { if (!isEditing()) playFromView(track.id); });
     list.append(li);
   });
-  $('empty').hidden = tracks.length > 0;
+
+  $('plBar').hidden = !inPlaylist;
+  $('empty').hidden = inPlaylist || tracks.length > 0;
+  $('emptyList').hidden = !inPlaylist || shown.length > 0;
   updateInfo();
+}
+
+// ---------- 입력 창 (이름 입력, 곡 선택) ----------
+// 내용을 채우는 build 함수는 '완료'를 눌렀을 때 반환할 값을 만드는 함수를 돌려준다.
+function openSheet(title, build) {
+  return new Promise((resolve) => {
+    const body = $('sheetBody');
+    body.textContent = '';
+    $('sheetTitle').textContent = title;
+    const collect = build(body);
+    const close = (value) => {
+      $('sheet').hidden = true;
+      $('sheetOk').onclick = $('sheetCancel').onclick = null;
+      resolve(value);
+    };
+    $('sheetOk').onclick = () => close(collect());
+    $('sheetCancel').onclick = () => close(null);
+    $('sheet').hidden = false;
+  });
+}
+
+function askName(title, initial) {
+  return openSheet(title, (body) => {
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'nameInput';
+    input.placeholder = '목록 이름';
+    input.maxLength = 40;
+    input.value = initial || '';
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') $('sheetOk').click(); });
+    body.append(input);
+    setTimeout(() => input.focus(), 50);
+    return () => input.value.trim() || null;
+  });
+}
+
+function pickTracks(playlist) {
+  return openSheet('곡 선택', (body) => {
+    const chosen = new Set(playlist.trackIds);
+    const ul = document.createElement('ul');
+    ul.className = 'pickList';
+    tracks.forEach((track) => {
+      const info = splitName(track.name);
+      const li = document.createElement('li');
+      const mark = document.createElement('span');
+      mark.className = 'mark';
+      const text = document.createElement('span');
+      text.className = 'pickText';
+      text.textContent = info.artist ? `${info.title} · ${info.artist}` : info.title;
+      li.append(mark, text);
+      const paint = () => li.classList.toggle('picked', chosen.has(track.id));
+      li.addEventListener('click', () => {
+        if (chosen.has(track.id)) chosen.delete(track.id); else chosen.add(track.id);
+        paint();
+      });
+      paint();
+      ul.append(li);
+    });
+    body.append(ul);
+    // 기존 순서를 유지하고, 새로 선택한 곡은 목록의 끝에 추가한다.
+    return () => [
+      ...playlist.trackIds.filter((id) => chosen.has(id)),
+      ...tracks.map((t) => t.id).filter((id) => chosen.has(id) && !playlist.trackIds.includes(id)),
+    ];
+  });
+}
+
+// ---------- 플레이리스트 ----------
+async function createPlaylist() {
+  const name = await askName('새 목록', '');
+  if (!name) return;
+  const p = { name, trackIds: [] };
+  p.id = await dbPutPlaylist(p);
+  playlists.push(p);
+  viewId = p.id;
+  renderChips();
+  renderList();
+}
+
+async function renamePlaylist() {
+  const p = playlistById(viewId);
+  if (!p) return;
+  const name = await askName('이름 변경', p.name);
+  if (!name) return;
+  p.name = name;
+  await dbPutPlaylist(p);
+  renderChips();
+  updateNowPlaying();
+}
+
+async function deletePlaylist() {
+  const p = playlistById(viewId);
+  if (!p) return;
+  if (!confirm(`'${p.name}' 목록을 삭제할까요?\n(곡은 보관함에 그대로 남습니다.)`)) return;
+  await dbDeletePlaylist(p.id);
+  playlists = playlists.filter((x) => x.id !== p.id);
+  if (contextId === p.id) { setContext(null); rebuildQueue(); }
+  viewId = null;
+  renderChips();
+  renderList();
+  preloadNext();
+}
+
+async function addFromLibrary() {
+  const p = playlistById(viewId);
+  if (!p) return;
+  if (!tracks.length) { setStatus("먼저 '+ 추가' 버튼으로 음원을 가져와 주세요."); return; }
+  const ids = await pickTracks(p);
+  if (!ids) return;
+  p.trackIds = ids;
+  await dbPutPlaylist(p);
+  if (contextId === p.id) rebuildQueue();
+  renderList();
+  preloadNext();
 }
 
 // ---------- 목록 편집 ----------
 async function moveTrack(index, step) {
   const other = index + step;
-  if (other < 0 || other >= tracks.length) return;
-  const a = tracks[index], b = tracks[other];
-  [a.order, b.order] = [b.order, a.order];
-  tracks.sort((x, y) => x.order - y.order);
-  await dbPutMeta([a, b]);
+  const p = playlistById(viewId);
+  if (p) {
+    const ids = idsOf(p.id);
+    if (other < 0 || other >= ids.length) return;
+    [ids[index], ids[other]] = [ids[other], ids[index]];
+    p.trackIds = ids;
+    await dbPutPlaylist(p);
+  } else {
+    if (other < 0 || other >= tracks.length) return;
+    const a = tracks[index], b = tracks[other];
+    [a.order, b.order] = [b.order, a.order];
+    tracks.sort((x, y) => x.order - y.order);
+    await dbPutMeta([a, b]);
+  }
   rebuildQueue();
   renderList();
   preloadNext();
 }
 
 async function removeTrack(track) {
-  if (!confirm(`'${splitName(track.name).title}' 곡을 앱에서 삭제할까요?\n('파일' 앱에 있는 원본은 삭제되지 않습니다.)`)) return;
-  await dbDelete(track.id);
-  tracks = tracks.filter((t) => t.id !== track.id);
-  if (track.id === currentId) {
-    audio.pause();
-    audio.removeAttribute('src');
-    audio.load();
-    realSource = false;
-    currentId = null;
-    localStorage.removeItem('current');
-    updateNowPlaying();
-    updatePlayIcon();
+  const p = playlistById(viewId);
+  if (p) {
+    // 플레이리스트 화면에서는 목록에서만 빼고, 보관함의 곡은 그대로 둔다.
+    p.trackIds = p.trackIds.filter((id) => id !== track.id);
+    await dbPutPlaylist(p);
+  } else {
+    if (!confirm(`'${splitName(track.name).title}' 곡을 앱에서 삭제할까요?\n('파일' 앱에 있는 원본은 삭제되지 않습니다.)`)) return;
+    await dbDelete(track.id);
+    tracks = tracks.filter((t) => t.id !== track.id);
+    for (const pl of playlists) {
+      if (pl.trackIds.includes(track.id)) {
+        pl.trackIds = pl.trackIds.filter((id) => id !== track.id);
+        await dbPutPlaylist(pl);
+      }
+    }
+    if (track.id === currentId) {
+      audio.pause();
+      audio.removeAttribute('src');
+      audio.load();
+      realSource = false;
+      currentId = null;
+      localStorage.removeItem('current');
+      updateNowPlaying();
+      updatePlayIcon();
+      renderChips();
+    }
   }
   rebuildQueue();
   renderList();
@@ -376,22 +599,34 @@ async function removeTrack(track) {
 // ---------- 음원 가져오기 ----------
 async function importFiles(files) {
   const list = Array.from(files).sort((a, b) => a.name.localeCompare(b.name, 'ko', { numeric: true }));
+  const target = playlistById(viewId);   // 플레이리스트 화면에서 가져오면 그 목록에도 추가한다.
   let order = tracks.reduce((max, t) => Math.max(max, t.order), 0);
   let added = 0, skipped = 0, failed = 0;
+  const touched = [];
 
   for (let i = 0; i < list.length; i++) {
     const file = list[i];
     setStatus(`음원을 가져오는 중입니다 (${i + 1}/${list.length})`);
-    if (tracks.some((t) => t.name === file.name && t.size === file.size)) { skipped++; continue; }
+    const existing = tracks.find((t) => t.name === file.name && t.size === file.size);
+    if (existing) { skipped++; touched.push(existing.id); continue; }
     try {
       const ext = (file.name.split('.').pop() || '').toLowerCase();
       const meta = { name: file.name, type: file.type || MIME[ext] || 'audio/mpeg', size: file.size, order: ++order };
       const buf = await file.arrayBuffer();
       meta.id = await dbAdd(meta, buf);
       tracks.push(meta);
+      touched.push(meta.id);
       added++;
     } catch (e) {
       failed++;
+    }
+  }
+
+  if (target) {
+    const fresh = touched.filter((id) => !target.trackIds.includes(id));
+    if (fresh.length) {
+      target.trackIds.push(...fresh);
+      await dbPutPlaylist(target);
     }
   }
 
@@ -399,7 +634,7 @@ async function importFiles(files) {
   renderList();
   preloadNext();
   const parts = [`${added}곡을 추가했습니다.`];
-  if (skipped) parts.push(`이미 있는 ${skipped}곡은 건너뛰었습니다.`);
+  if (skipped) parts.push(`이미 보관함에 있는 ${skipped}곡은 다시 저장하지 않았습니다.`);
   if (failed) parts.push(`${failed}곡은 저장하지 못했습니다(저장 공간을 확인해 주세요).`);
   setStatus(parts.join(' '));
   setTimeout(() => setStatus(''), 5000);
@@ -419,6 +654,10 @@ $('editBtn').addEventListener('click', () => {
   $('editBtn').textContent = on ? '완료' : '편집';
   $('editBtn').classList.toggle('on', on);
 });
+
+$('plAddBtn').addEventListener('click', addFromLibrary);
+$('plRenameBtn').addEventListener('click', renamePlaylist);
+$('plDeleteBtn').addEventListener('click', deletePlaylist);
 
 $('playBtn').addEventListener('click', () => { unlock(); togglePlay(); });
 $('nextBtn').addEventListener('click', goNext);
@@ -450,11 +689,20 @@ $('seek').addEventListener('change', () => {
 
 // ---------- 시작 ----------
 async function init() {
-  tracks = (await dbAllMeta()).sort((a, b) => a.order - b.order);
+  tracks = (await dbAll('meta')).sort((a, b) => a.order - b.order);
+  playlists = await dbAll('playlists');
+
+  const savedContext = Number(localStorage.getItem('context'));
+  if (playlistById(savedContext)) contextId = savedContext;
+  viewId = contextId;
+
   const saved = Number(localStorage.getItem('current'));
-  if (tracks.some((t) => t.id === saved)) currentId = saved;
+  if (trackById(saved)) currentId = saved;
+
   rebuildQueue();
+  bindMediaActions();
   updateModeButtons();
+  renderChips();
   renderList();
   updateNowPlaying();
 
@@ -465,7 +713,15 @@ async function init() {
 
   // 저장 공간이 부족할 때 브라우저가 음원을 임의로 지우지 않도록 요청한다.
   if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
-  if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+
+  if ('serviceWorker' in navigator) {
+    // 새 버전이 설치되면, 재생 중이 아닐 때에 한하여 화면을 새로 불러와서 바로 적용한다.
+    const hadController = !!navigator.serviceWorker.controller;
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      if (hadController && audio.paused) location.reload();
+    });
+    navigator.serviceWorker.register('sw.js').catch(() => {});
+  }
 }
 
 init().catch((e) => setStatus('저장소를 열지 못했습니다: ' + (e && e.message ? e.message : e)));

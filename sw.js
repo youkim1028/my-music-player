@@ -1,6 +1,6 @@
 // 앱 화면 파일을 기기에 저장하여 인터넷 연결이 없어도 실행되도록 한다.
 // 음원은 IndexedDB에 따로 저장되므로 여기에서 다루지 않는다.
-const CACHE = 'my-music-v1';
+const CACHE = 'my-music-v2';
 const ASSETS = ['./', 'index.html', 'app.js', 'manifest.webmanifest', 'icon-180.png', 'icon-512.png'];
 
 self.addEventListener('install', (event) => {
